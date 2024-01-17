@@ -1,0 +1,673 @@
+metadata:
+  version: "1"
+  dependencies:
+    apps:
+      - id: dynatrace.automations
+        version: ^1.237.1
+  inputs: []
+workflow:
+  title: Log Permissions - Security Context
+  tasks:
+    js_get_groups:
+      name: js_get_groups
+      description: Build a custom task running js Code
+      action: dynatrace.automations:run-javascript
+      input:
+        script: >-
+          import { execution } from '@dynatrace-sdk/automation-utils';
+
+
+          const PARAMETERS_TASK_ID = "js_set_parameters";
+
+          const BEARER_TASK_ID = "js_get_bearer_token_groups";
+
+
+          export default async function ({ execution_id }) {
+
+            // get the bearer token from previous task
+            const exe = await execution(execution_id);
+            var bearer_token = await exe.result(BEARER_TASK_ID);
+
+            // get the parameters from previous task
+            var parameters = await exe.result(PARAMETERS_TASK_ID);
+            var accountId = parameters['account_id'];
+
+            // set the fetch() api parameters [url, method, headers, body]
+            const url = "https://api.dynatrace.com/iam/v1/accounts/" + accountId + "/groups";
+            const options = {
+              method: "GET",
+              headers: {
+                'Authorization': "Bearer " + bearer_token
+              }
+            };
+
+            // execute the fetch() api call to get the group details
+            const resp = await fetch(url,options);
+            const resp_json = await resp.json();
+            const existing_groups = resp_json['items'];
+            
+            return existing_groups;
+          }
+      position:
+        x: 0
+        y: 9
+      predecessors:
+        - js_get_bearer_token_groups
+      conditions:
+        states:
+          js_get_bearer_token_groups: SUCCESS
+    js_get_policies:
+      name: js_get_policies
+      description: Build a custom task running js Code
+      action: dynatrace.automations:run-javascript
+      input:
+        script: >-
+          import { execution } from '@dynatrace-sdk/automation-utils';
+
+
+          const PARAMETERS_TASK_ID = "js_set_parameters";
+
+          const BEARER_TASK_ID = "js_get_bearer_token_policies";
+
+
+          export default async function ({ execution_id }) {
+
+            // get the bearer token from previous task
+            const exe = await execution(execution_id);
+            var bearer_token = await exe.result(BEARER_TASK_ID);
+
+            // get the parameters from previous task
+            var parameters = await exe.result(PARAMETERS_TASK_ID);
+            var policy_prefix = parameters['policy_prefix'];
+            var levelType = parameters['policy_scope'];
+            var levelId;
+            if(levelType == "account") {
+              levelId = parameters['account_id'];
+            } else if (levelType == "environment") {
+              levelId = parameters['environment_id'];
+            } else {
+              console.log("invalid policy scope.");
+              return;
+            }
+
+            // set the fetch() api parameters [url, method, headers, body]
+            const url = "https://api.dynatrace.com/iam/v1/repo/" + levelType + "/" + levelId + "/policies/aggregate";
+            const options = {
+              method: "GET",
+              headers: {
+                'Authorization': "Bearer " + bearer_token
+              }
+            };
+
+            // execute the fetch() api call to get the policy details
+            const resp = await fetch(url,options);
+            const resp_json = await resp.json();
+            const existing_policies = resp_json['policyOverviewList'];
+
+            // loop through existing policies and keep those with matching prefix name
+            var filtered_policies = new Array();
+            for(var p=0; p<existing_policies.length; p++) {
+              if(existing_policies[p]['name'].startsWith(policy_prefix)) {
+                filtered_policies.push(existing_policies[p]);
+              }
+            }
+            
+            return filtered_policies;
+          }
+      position:
+        x: 0
+        y: 4
+      predecessors:
+        - js_get_bearer_token_policies
+      conditions:
+        states:
+          js_get_bearer_token_policies: SUCCESS
+    js_set_parameters:
+      name: js_set_parameters
+      description: Build a custom task running js Code
+      action: dynatrace.automations:run-javascript
+      input:
+        script: >-
+          import { execution } from '@dynatrace-sdk/automation-utils';
+
+
+          export default async function ({ execution_id }) {
+
+            let result = {
+              create_policies: false, // create the policies (versus just validate the configuration)
+              bind_policies: false, // bind the policies to existing groups if they exist
+              client_id: "dt0s02.ABC123", // account oauth client id
+              client_credential: "CREDENTIALS_VAULT-ABC123", // client secret stored in credential vault, the vault id "CREDENTIALS_VAULT-8C538A4B0314FDE"
+              account_id: "UUID", // account id (UUID) from myaccount.dynatrace.com
+              environment_id: "abc123", // saas tenant id
+              policy_scope: "account", // "account" or "environment" only
+              policy_prefix: "Log Security Context - ", // policy name prefix, context will be appended
+              policy_description: "Provides access to read log data where dt.security_context equals ", // policy description prefix
+              exclusions: [ // security contexts that should be excluded (skipped)
+                'sample-1',
+                'sample-2'
+              ]
+            }
+
+            return result;
+          }
+      position:
+        x: -1
+        y: 1
+      predecessors: []
+    js_create_bindings:
+      name: js_create_bindings
+      description: Build a custom task running js Code
+      action: dynatrace.automations:run-javascript
+      input:
+        script: >-
+          import { execution, actionExecution } from
+          '@dynatrace-sdk/automation-utils';
+
+
+          const PARAMETERS_TASK_ID = "js_set_parameters";
+
+          const BINDINGS_TASK_ID = "js_determine_bindings";
+
+          const BEARER_TASK_ID = "js_get_bearer_token_groups";
+
+
+          export default async function ({ execution_id, action_execution_id }) {
+
+            // get the binding loop item for the action execution
+            const actionEx = await actionExecution(action_execution_id);
+            const binding = actionEx.loopItem['binding'];
+            
+            // get the bearer token from previous task
+            const exe = await execution(execution_id);
+            var bearer_token = await exe.result(BEARER_TASK_ID);
+            
+            // get the parameters from previous task
+            var parameters = await exe.result(PARAMETERS_TASK_ID);
+            var levelType = parameters['policy_scope'];
+            var levelId;
+            if(levelType == "account") {
+              levelId = parameters['account_id'];
+            } else if (levelType == "environment") {
+              levelId = parameters['environment_id'];
+            } else {
+              console.log("invalid policy scope.");
+              return;
+            }
+
+            // set the fetch() api parameters [url, method, headers, body]
+            const url = "https://api.dynatrace.com/iam/v1/repo/" + levelType + "/" + levelId + "/bindings/" + binding['policy'];
+            const options = {
+              method: "POST",
+              headers: {
+                'Content-Type': "application/json",
+                'Authorization': "Bearer " + bearer_token
+              },
+              body: JSON.stringify({
+                "groups": [
+                  binding['group']
+                ]
+              })
+            };
+            // execute the fetch() api call to create the binding
+            const resp = await fetch(url,options);
+
+            const results = {
+              'status': resp.status,
+              'context': binding['context'],
+              'response': resp.body
+            }
+
+            return results;
+          }
+      position:
+        x: -1
+        y: 11
+      predecessors:
+        - js_determine_bindings
+      conditions:
+        states:
+          js_determine_bindings: SUCCESS
+        custom: "{{ result('js_determine_bindings') | length >= 1 and
+          result(\"js_set_parameters\").create_bindings == true }}"
+      timeout: 500
+      concurrency: 1
+      withItems: binding in {{ result('js_determine_bindings') }}
+    js_remove_existing:
+      name: js_remove_existing
+      description: Build a custom task running js Code
+      action: dynatrace.automations:run-javascript
+      active: true
+      input:
+        script: >-
+          import { execution } from '@dynatrace-sdk/automation-utils';
+
+
+          const PARAMETERS_TASK_ID = "js_set_parameters";
+
+          const POLICIES_TASK_ID = "js_get_policies";
+
+          const CONTEXTS_TASK_ID = "dql_query_security_contexts";
+
+
+          export default async function ({ execution_id }) {
+
+            // get the parameters from previous task
+            const exe = await execution(execution_id);
+            var parameters = await exe.result(PARAMETERS_TASK_ID);
+            const exclusions = parameters['exclusions'];
+
+            // get the policies from previous task
+            var policies_result = await exe.result(POLICIES_TASK_ID);
+            
+            // get the security contexts from previous task
+            var contexts_result = await exe.result(CONTEXTS_TASK_ID);
+            contexts_result = contexts_result['records'];
+
+            // loop through security contexts and keep only those without an existing policy
+            var filtered_contexts = new Array();
+            for(var c=0; c<contexts_result.length; c++) {
+              // get the current context
+              const context = contexts_result[c]['dt.security_context'];
+              // check if current context is on the exclusions list from parameters
+              if(exclusions.includes(context)){
+                console.log('exclude ' + context);
+                continue;
+              }
+              var exists = false;
+              // loop through policies and check for match
+              for(var p=0; p<policies_result.length; p++) {
+                if(policies_result[p]['name'].endsWith(context)) {
+                  exists = true;
+                  break;
+                }
+              }
+              // if the policy doesn't exist, add it to the list of filtered contexts
+              if(exists == false) {
+                filtered_contexts.push(context);
+              }
+            }
+            
+            return filtered_contexts;
+          }
+      position:
+        x: 0
+        y: 5
+      predecessors:
+        - js_get_policies
+      conditions:
+        states:
+          js_get_policies: SUCCESS
+        custom: ""
+    js_determine_bindings:
+      name: js_determine_bindings
+      description: Build a custom task running js Code
+      action: dynatrace.automations:run-javascript
+      input:
+        script: >-
+          import { execution } from '@dynatrace-sdk/automation-utils';
+
+
+          const PARAMETERS_TASK_ID = "js_set_parameters";
+
+          const POLICIES_TASK_ID = "js_create_policies_loop";
+
+          const GROUPS_TASK_ID = "js_get_groups";
+
+
+          export default async function ({ execution_id }) {
+
+            // get the parameters from previous task
+            const exe = await execution(execution_id);
+            var parameters = await exe.result(PARAMETERS_TASK_ID);
+            const exclusions = parameters['exclusions'];
+
+            // get the policies from previous task
+            var policies_result = await exe.result(POLICIES_TASK_ID);
+            
+            // get the groups from previous task
+            var groups_result = await exe.result(GROUPS_TASK_ID);
+
+            // loop through groups and keep only those with a matching policy
+            var bindings = new Array();
+            for(var g=0; g<groups_result.length; g++) {
+              // get the current group
+              const group = groups_result[g];
+              // loop through policies and check for match
+              for(var p=0; p<policies_result.length; p++) {
+                //console.log('group: ' + group['name'] + ' | policy: ' + policies_result[p]['context']);
+                if(group['name'] == policies_result[p]['context']) {
+                  const binding = {
+                    "context": policies_result[p]['context'],
+                    "policy": policies_result[p]['response']['uuid'],
+                    "group": group['uuid']
+                  }
+                  bindings.push(binding);
+                }
+              }
+            }
+            
+            return bindings;
+          }
+      position:
+        x: 0
+        y: 10
+      predecessors:
+        - js_get_groups
+      conditions:
+        states:
+          js_get_groups: SUCCESS
+        custom: "{{ result('js_get_groups') | length >= 1 }}"
+    js_check_policies_loop:
+      name: js_check_policies_loop
+      description: Build a custom task running js Code
+      action: dynatrace.automations:run-javascript
+      input:
+        script: >-
+          import { execution, actionExecution } from
+          '@dynatrace-sdk/automation-utils';
+
+
+          const PARAMETERS_TASK_ID = "js_set_parameters";
+
+          const CONTEXTS_TASK_ID = "js_remove_existing";
+
+          const BEARER_TASK_ID = "js_get_bearer_token_policies";
+
+
+          export default async function ({ execution_id, action_execution_id }) {
+
+            // get the context loop item for the action execution
+            const actionEx = await actionExecution(action_execution_id);
+            const context = actionEx.loopItem['context'];
+            
+            // get the bearer token from previous task
+            const exe = await execution(execution_id);
+            var bearer_token = await exe.result(BEARER_TASK_ID);
+            
+            // get the parameters from previous task
+            var parameters = await exe.result(PARAMETERS_TASK_ID);
+            var policy_prefix = parameters['policy_prefix'];
+            var policy_description = parameters['policy_description'];
+            var levelType = parameters['policy_scope'];
+            var levelId = parameters['account_id'];
+
+            // set the fetch() api parameters [url, method, headers, body]
+            const url = "https://api.dynatrace.com/iam/v1/repo/" + levelType + "/" + levelId + "/policies/validation";
+            const options = {
+              method: "POST",
+              headers: {
+                'Content-Type': "application/json",
+                'Authorization': "Bearer " + bearer_token
+              },
+              body: JSON.stringify({
+                "name": policy_prefix + context,
+                "description": policy_description + context,
+                "statementQuery": 'ALLOW storage:logs:read WHERE storage:dt.security_context="' + context + '";'
+              })
+            };
+            // execute the fetch() api call to create the policy
+            const resp = await fetch(url,options);
+            
+            const results = {
+              'status': resp.status,
+              'context': context
+            }
+            
+            return results;
+          }
+      position:
+        x: -1
+        y: 6
+      predecessors:
+        - js_remove_existing
+      conditions:
+        states:
+          js_remove_existing: SUCCESS
+        custom: "{{ result('js_remove_existing') | length >= 1 }}"
+      timeout: 500
+      concurrency: 1
+      withItems: context in {{ result('js_remove_existing') }}
+    js_create_policies_loop:
+      name: js_create_policies_loop
+      description: Build a custom task running js Code
+      action: dynatrace.automations:run-javascript
+      input:
+        script: >-
+          import { execution, actionExecution } from
+          '@dynatrace-sdk/automation-utils';
+
+
+          const PARAMETERS_TASK_ID = "js_set_parameters";
+
+          const CONTEXTS_TASK_ID = "js_remove_existing";
+
+          const BEARER_TASK_ID = "js_get_bearer_token_policies";
+
+
+          export default async function ({ execution_id, action_execution_id }) {
+
+            // get the context loop item for the action execution
+            const actionEx = await actionExecution(action_execution_id);
+            const context = actionEx.loopItem['context'];
+            
+            // get the bearer token from previous task
+            const exe = await execution(execution_id);
+            var bearer_token = await exe.result(BEARER_TASK_ID);
+            
+            // get the parameters from previous task
+            var parameters = await exe.result(PARAMETERS_TASK_ID);
+            var policy_prefix = parameters['policy_prefix'];
+            var policy_description = parameters['policy_description'];
+            var levelType = parameters['policy_scope'];
+            var levelId;
+            if(levelType == "account") {
+              levelId = parameters['account_id'];
+            } else if (levelType == "environment") {
+              levelId = parameters['environment_id'];
+            } else {
+              console.log("invalid policy scope.");
+              return;
+            }
+
+            // set the fetch() api parameters [url, method, headers, body]
+            const url = "https://api.dynatrace.com/iam/v1/repo/" + levelType + "/" + levelId + "/policies";
+            const options = {
+              method: "POST",
+              headers: {
+                'Content-Type': "application/json",
+                'Authorization': "Bearer " + bearer_token
+              },
+              body: JSON.stringify({
+                "name": policy_prefix + context,
+                "description": policy_description + context,
+                "statementQuery": 'ALLOW storage:logs:read WHERE storage:dt.security_context="' + context + '";'
+              })
+            };
+            // execute the fetch() api call to create the policy
+            const resp = await fetch(url,options);
+            const resp_json = await resp.json();
+
+            const results = {
+              'status': resp.status,
+              'response': resp_json,
+              'context': context
+            }
+
+            return results;
+          }
+      position:
+        x: -1
+        y: 7
+      predecessors:
+        - js_check_policies_loop
+      conditions:
+        states:
+          js_check_policies_loop: SUCCESS
+        custom: "{{ result('js_remove_existing') | length >= 1 and
+          result(\"js_set_parameters\").create_policies == true }}"
+      timeout: 500
+      concurrency: 1
+      withItems: context in {{ result('js_remove_existing') }}
+    js_get_bearer_token_groups:
+      name: js_get_bearer_token_groups
+      description: Build a custom task running js Code
+      action: dynatrace.automations:run-javascript
+      input:
+        script: >-
+          import { credentialVaultClient } from
+          '@dynatrace-sdk/client-classic-environment-v2';
+
+          import { execution } from '@dynatrace-sdk/automation-utils';
+
+
+          const PARAMETERS_TASK_ID = "js_set_parameters";
+
+
+          export default async function ({ execution_id }) {
+
+            // get the parameters from previous task
+            const exe = await execution(execution_id);
+            var parameters = await exe.result(PARAMETERS_TASK_ID);
+            var client_id = parameters['client_id'];
+            var client_credential = parameters['client_credential'];
+            
+            // get the account management oauth client secret from the credential vault using the SDK
+            const data = (await credentialVaultClient.getCredentialsDetails({id: client_credential}));
+            var client_secret = data['token'];
+
+            // set the form values and encode them
+            const grant_type = encodeURIComponent("client_credentials");
+            const scope = encodeURIComponent("iam-policies-management account-idm-read");
+            client_id = encodeURIComponent(client_id);
+            client_secret = encodeURIComponent(client_secret);
+            
+            // set the fetch() api parameters [method, headers, body]
+            const options = {
+            method: "POST",
+            headers: {
+              'content-type': "application/x-www-form-urlencoded",
+            },
+              body: "grant_type=" + grant_type + "&scope=" + scope + "&client_id=" + client_id + "&client_secret=" + client_secret
+            };
+            
+            // execute the fetch() api call to register the user
+            const resp = await fetch("https://sso.dynatrace.com/sso/oauth2/token",options);
+            console.log(resp.status);
+
+            var bearer_token = "";
+            if(resp.status == 200) {
+              const resp_json = await resp.json();
+              bearer_token = await resp_json['access_token'];
+            }
+
+            return bearer_token;
+          }
+      position:
+        x: 1
+        y: 8
+      predecessors:
+        - js_create_policies_loop
+        - js_remove_existing
+      conditions:
+        states:
+          js_remove_existing: SUCCESS
+          js_create_policies_loop: SUCCESS
+    dql_query_security_contexts:
+      name: dql_query_security_contexts
+      description: Executes DQL query
+      action: dynatrace.automations:execute-dql-query
+      input:
+        query: |-
+          fetch logs, from: now()-24h
+          | summarize count(), by: {dt.security_context}
+          | fields dt.security_context
+          | parse dt.security_context, "[{*}0-9{*}a-z{1}-]{3,30}:parsed"
+          | filterOut isNull(parsed)
+          | fields dt.security_context = parsed
+          | limit 50
+      position:
+        x: 0
+        y: 2
+      predecessors:
+        - js_set_parameters
+      conditions:
+        states:
+          js_set_parameters: SUCCESS
+    js_get_bearer_token_policies:
+      name: js_get_bearer_token_policies
+      description: Build a custom task running js Code
+      action: dynatrace.automations:run-javascript
+      input:
+        script: >-
+          import { credentialVaultClient } from
+          '@dynatrace-sdk/client-classic-environment-v2';
+
+          import { execution } from '@dynatrace-sdk/automation-utils';
+
+
+          const PARAMETERS_TASK_ID = "js_set_parameters";
+
+
+          export default async function ({ execution_id }) {
+
+            // get the parameters from previous task
+            const exe = await execution(execution_id);
+            var parameters = await exe.result(PARAMETERS_TASK_ID);
+            var client_id = parameters['client_id'];
+            var client_credential = parameters['client_credential'];
+            
+            // get the account management oauth client secret from the credential vault using the SDK
+            const data = (await credentialVaultClient.getCredentialsDetails({id: client_credential}));
+            var client_secret = data['token'];
+
+            // set the form values and encode them
+            const grant_type = encodeURIComponent("client_credentials");
+            const scope = encodeURIComponent("iam-policies-management");
+            client_id = encodeURIComponent(client_id);
+            client_secret = encodeURIComponent(client_secret);
+            
+            // set the fetch() api parameters [method, headers, body]
+            const options = {
+            method: "POST",
+            headers: {
+              'content-type': "application/x-www-form-urlencoded",
+            },
+              body: "grant_type=" + grant_type + "&scope=" + scope + "&client_id=" + client_id + "&client_secret=" + client_secret
+            };
+            
+            // execute the fetch() api call to register the user
+            const resp = await fetch("https://sso.dynatrace.com/sso/oauth2/token",options);
+            console.log(resp.status);
+
+            var bearer_token = "";
+            if(resp.status == 200) {
+              const resp_json = await resp.json();
+              bearer_token = await resp_json['access_token'];
+            }
+
+            return bearer_token;
+          }
+      position:
+        x: 1
+        y: 3
+      predecessors:
+        - dql_query_security_contexts
+      conditions:
+        states:
+          dql_query_security_contexts: SUCCESS
+  description: ""
+  trigger:
+    schedule:
+      rule: null
+      trigger:
+        type: time
+        time: 01:00
+      timezone: America/Chicago
+      isActive: true
+      isFaulty: false
+      nextExecution: 2024-01-18T07:00:00.000Z
+      filterParameters:
+        earliestStart: 2024-01-17
+      inputs: {}
+  schemaVersion: 3
