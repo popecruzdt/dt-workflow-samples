@@ -18,6 +18,13 @@ fetch logs, from: now()-24h
 ```
 #### Clean up security context values with log processing rules
   * Documentation: https://docs.dynatrace.com/docs/observe-and-explore/logs/log-management-and-analytics/lma-security-context
+#### Dynatrace OAuth Client stored in Credential Vault
+  * Create a Dynatrace OAuth Client: https://docs.dynatrace.com/docs/manage/account-management/identity-access-management/account-api-oauth
+  * OAuth Client Permissions must include `View users and groups`, `Manage users and groups`, `View and manage policies`
+  * Copy the `Client ID` and `Client secret` for later use
+  * Create a Credential Vault entry of `Type` equals `Token` and `Scope` equals `AppEngine`
+  * Copy the `Credential ID` for later use
+  
 
 ## Deployment:
 #### Upload the Workflow Template into your Dynatrace SaaS tenant
