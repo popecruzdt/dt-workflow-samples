@@ -17,7 +17,7 @@ This sample workflow automates the creation of management zones based on monitor
 ## Deployment:
 #### Upload the Workflow Template into your Dynatrace SaaS tenant
   * Download `wftpl_kubernetes_namespace_mz.yaml`
-  * From the Workfows App, choose Upload 
+  * From the Workflows App, choose Upload 
 
 ## Setup:
 #### Modify the fixed time trigger
