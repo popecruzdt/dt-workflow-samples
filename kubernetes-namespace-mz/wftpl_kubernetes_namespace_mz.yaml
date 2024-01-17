@@ -1,0 +1,432 @@
+metadata:
+  version: "1"
+  dependencies:
+    apps:
+      - id: dynatrace.automations
+        version: ^1.237.1
+  inputs: []
+workflow:
+  title: Kubernetes Namespace Management Zones
+  tasks:
+    js_set_parameters:
+      name: js_set_parameters
+      description: Build a custom task running js Code
+      action: dynatrace.automations:run-javascript
+      input:
+        script: >-
+          export default async function () {
+
+            // Tenant connection details
+            const dt_saas_tenant = "abc123"; // "abc123" portion only
+            // Credential Vault object, Api-Token with 'ReadConfig' and 'WriteConfig' access scopes
+            const dt_token_credential = "CREDENTIALS_VAULT-E4R6795DDDFF16D2" // "CREDENTIALS_VAULT-E4R6795DDDFF16D2" format
+            // Management zone prefix
+            const mz_prefix = "k8s-"; // i.e. k8s- , ocp- , eks- , etc
+            // Namespace excludes array
+            const ns_excludes = ['kube-public','kube-system'];
+            // Management Zone config template URL
+            const mz_config_url = "https://raw.githubusercontent.com/popecruzdt/dt-workflow-samples/main/kubernetes-namespace-mz/k8s_mz_template.json"
+            // Safeguard, prevent infinite loop
+            const max_loop = 100; // May need to be increased in larger environments
+            // Update existing management zones, otherwise skip if it already exists
+            const update_mz = false;
+            
+            return { dt_saas_tenant, dt_token_credential, mz_prefix, ns_excludes, max_loop, update_mz };
+          }
+      position:
+        x: -1
+        y: 1
+      predecessors: []
+    js_management_zone_create:
+      name: js_management_zone_create
+      description: Build a custom task running js Code
+      action: dynatrace.automations:run-javascript
+      active: true
+      input:
+        script: >-
+          import { execution } from '@dynatrace-sdk/automation-utils';
+
+          import { queryExecutionClient } from '@dynatrace-sdk/client-query';
+
+          import { credentialVaultClient } from "@dynatrace-sdk/client-classic-environment-v2";
+
+
+          // Nothing below this comment should need to be changed (unless making enhancements/fixes)
+            
+          export default async function ({ execution_id }) {
+
+            // get parameters and results from previous tasks
+            const exe = await execution(execution_id);
+            // parameters
+            const parameters = await exe.result('js_set_parameters');
+            const FREE_THRESHOLD = parameters['THRESHOLD'];
+            const DELTA_THRESHOLD = parameters['DELTA_THRESHOLD'];
+            
+            // Tenant connection details
+            const dt_saas_tenant = parameters['dt_saas_tenant'];
+            // Credential Vault object, Api-Token with 'ReadConfig' and 'WriteConfig' access scopes
+            const dt_token_credential = parameters['dt_token_credential'];
+            // Management zone prefix
+            const mz_prefix = parameters['mz_prefix'];
+            // Namespace excludes array
+            const ns_excludes = parameters['ns_excludes'];
+            // Management Zone config URL
+            const mz_config_url = parameters['mz_config_url'];
+            // Safeguard, prevent infinite loop
+            const max_loop = parameters['max_loop'];
+            // Update existing management zones, otherwise skip if it already exists
+            const update_mz = parameters['update_mz'];
+            
+            // Query process group entities to identify namespaces (with process group entities)
+            const timeout = 60;
+            const query = 'fetch dt.entity.process_group, from: now()-1d | fields namespace = belongs_to[dt.entity.cloud_application_namespace][0] | filter isNotNull(namespace) | lookup [fetch dt.entity.cloud_application_namespace | fields id, entity.name], lookupField: id, sourceField:namespace, prefix:"namespace." | fields name = namespace.entity.name | summarize namespaces = collectDistinct(name)';
+            const query_response = await queryExecutionClient.queryExecute({ body: { query, requestTimeoutMilliseconds: timeout * 1000, fetchTimeoutSeconds: timeout  } });
+            const namespaces = query_response.result.records[0]['namespaces'];
+            console.log("Namespaces found: " + namespaces.length);
+            console.log(namespaces);
+
+            // If there aren't any namespace found, exit/return
+            if(namespaces.length <= 0)
+              return namespaces;
+
+            // Get the API token credential from Credential Vault
+            const dt_credential_resp = (await credentialVaultClient.getCredentialsDetails({id: dt_token_credential}));
+            const dt_token = dt_credential_resp['token'];
+            
+            // Query existing management zones from Dynatrace tenant
+            var dt_config_api_url = "https://" + dt_saas_tenant + ".live.dynatrace.com/api/config/v1/managementZones"
+            var dt_config_api_headers = {
+              'Authorization': "Api-Token " + dt_token
+            }
+            var dt_config_api_options = {
+              method: "GET",
+              headers: dt_config_api_headers
+            };
+            const dt_config_api_mz_resp = await fetch(dt_config_api_url,dt_config_api_options);
+            const dt_config_api_mz_resp_json = await dt_config_api_mz_resp.json();
+            var dt_existing_mz = dt_config_api_mz_resp_json['values'];
+
+            // Remove management zones that don't start with the prefix from the list
+            for(var i=0;i<dt_existing_mz.length; i++) {
+              if(!dt_existing_mz[i]['name'].startsWith(mz_prefix)) {
+                dt_existing_mz.splice(i,1);
+                i = 0;
+              }
+              if(i>=max_loop){break;}
+            }
+
+            console.log("Existing MZ:");
+            console.log(dt_existing_mz);
+            
+            // Fetch the management zone configuration JSON template from source
+            const mz_template_resp = await fetch(mz_config_url);
+            var mz_template_json = await mz_template_resp.json();
+            
+            for(var i=0; i<namespaces.length; i++) {
+
+              // Check if namespace should be excluded
+              if(ns_excludes.includes(namespaces[i])) {
+                console.log("MZ: " + mz_prefix + namespaces[i] + "; Skipped (exclude list)");   
+                continue;
+              }
+
+              // Define the management zone name
+              var mz_name = mz_prefix + namespaces[i];
+              
+              // Check if management zone already exists
+              var mz_exists;
+              var mz_id;
+              for(var e=0;e<dt_existing_mz.length;e++) {
+                if(dt_existing_mz[e]['name'] == mz_name) {
+                  mz_exists = true;
+                  mz_id = dt_existing_mz[e]['id'];
+                }
+              }
+              
+              // Replace variables in JSON template
+              var mz_template_string = JSON.stringify(mz_template_json);
+              mz_template_string = mz_template_string.replaceAll('<PREFIX>',mz_prefix);
+              mz_template_string = mz_template_string.replaceAll('<NAMESPACE>',namespaces[i]);
+              var mz_template_replace = JSON.parse(mz_template_string);
+
+              // Create or update management zone
+              if(mz_exists) { // If management zone exists, call PUT endpoint to update configuration
+
+                // Check if update_mz is false, if so skip
+                if(!update_mz) {
+                  console.log("MZ: " + mz_name + "; Skipped (Exists, Update is False)");
+                  continue;
+                }
+                // Build http fetch PUT call to Dynatrace tenant
+                dt_config_api_url = "https://" + dt_saas_tenant + ".live.dynatrace.com/api/config/v1/managementZones/" + mz_id;
+                dt_config_api_headers = {
+                  'content-type': "application/json; charset=utf-8",
+                  'Authorization': "Api-Token " + dt_token
+                }
+                
+                // Declare http fetch options
+                const dt_config_api_options = {
+                method: "PUT",
+                headers: dt_config_api_headers,
+                body: JSON.stringify(mz_template_replace)
+                };
+            
+                // Execute the fetch() api call to update the management zone
+                const dt_config_api_resp = await fetch(dt_config_api_url,dt_config_api_options);
+                if(dt_config_api_resp.status == 204) {
+                  console.log("MZ: " + mz_name + "; 204 - Success. The management zone has been updated.");
+                } else {
+                  const dt_config_api_resp_json = await dt_config_api_resp.json();
+                  console.log("MZ: " + mz_name + "; Response: " + dt_config_api_resp.status + " Code; ");
+                  console.log(dt_config_api_resp_json);
+                }
+                
+              } 
+              else if (!mz_exists) { // If management zone does not exist, call POST endpoint to create configuration
+
+                // Build http fetch POST call to Dynatrace tenant
+                dt_config_api_url = "https://" + dt_saas_tenant + ".live.dynatrace.com/api/config/v1/managementZones";
+                dt_config_api_headers = {
+                  'content-type': "application/json; charset=utf-8",
+                  'Authorization': "Api-Token " + dt_token
+                }
+                
+                // Declare http fetch options
+                const dt_config_api_options = {
+                method: "POST",
+                headers: dt_config_api_headers,
+                body: JSON.stringify(mz_template_replace)
+                };
+            
+                // Execute the fetch() api call to update the management zone
+                const dt_config_api_resp = await fetch(dt_config_api_url,dt_config_api_options);
+                if(dt_config_api_resp.status == 201) {
+                  console.log("MZ: " + mz_name + "; 201 - Success. The management zone has been created.");
+                } else {
+                  const dt_config_api_resp_json = await dt_config_api_resp.json();
+                  console.log("MZ: " + mz_name + "; Response: " + dt_config_api_resp.status + " Code; ");
+                  console.log(dt_config_api_resp_json);
+                }
+                
+              } 
+              else {
+                console.log("How did we get here? " + mz_name);
+              }
+              
+            }
+
+            
+          }
+      position:
+        x: 0
+        y: 3
+      predecessors:
+        - js_management_zone_validate
+      conditions:
+        states:
+          js_management_zone_validate: SUCCESS
+    js_management_zone_validate:
+      name: js_management_zone_validate
+      description: Build a custom task running js Code
+      action: dynatrace.automations:run-javascript
+      active: true
+      input:
+        script: >-
+          import { execution } from '@dynatrace-sdk/automation-utils';
+
+          import { queryExecutionClient } from '@dynatrace-sdk/client-query';
+
+          import { credentialVaultClient } from "@dynatrace-sdk/client-classic-environment-v2";
+
+
+          // Nothing below this comment should need to be changed (unless making enhancements/fixes)
+            
+          export default async function ({ execution_id }) {
+
+            // Make sure the variables match for both '_validate' and '_create' tasks!
+
+            // get parameters and results from previous tasks
+            const exe = await execution(execution_id);
+            // parameters
+            const parameters = await exe.result('js_set_parameters');
+            const FREE_THRESHOLD = parameters['THRESHOLD'];
+            const DELTA_THRESHOLD = parameters['DELTA_THRESHOLD'];
+            
+            // Tenant connection details
+            const dt_saas_tenant = parameters['dt_saas_tenant'];
+            // Credential Vault object, Api-Token with 'ReadConfig' and 'WriteConfig' access scopes
+            const dt_token_credential = parameters['dt_token_credential'];
+            // Management zone prefix
+            const mz_prefix = parameters['mz_prefix'];
+            // Namespace excludes array
+            const ns_excludes = parameters['ns_excludes'];
+            // Management Zone config URL
+            const mz_config_url = parameters['mz_config_url'];
+            // Safeguard, prevent infinite loop
+            const max_loop = parameters['max_loop'];
+            // Update existing management zones, otherwise skip if it already exists
+            const update_mz = parameters['update_mz'];
+            
+            // Query process group entities to identify namespaces (with process group entities)
+            const timeout = 60;
+            const query = 'fetch dt.entity.process_group, from: now()-1d | fields namespace = belongs_to[dt.entity.cloud_application_namespace][0] | filter isNotNull(namespace) | lookup [fetch dt.entity.cloud_application_namespace | fields id, entity.name], lookupField: id, sourceField:namespace, prefix:"namespace." | fields name = namespace.entity.name | summarize namespaces = collectDistinct(name)';
+            const query_response = await queryExecutionClient.queryExecute({ body: { query, requestTimeoutMilliseconds: timeout * 1000, fetchTimeoutSeconds: timeout  } });
+            const namespaces = query_response.result.records[0]['namespaces'];
+            console.log("Namespaces found: " + namespaces.length);
+            console.log(namespaces);
+
+            // If there aren't any namespace found, exit/return
+            if(namespaces.length <= 0)
+              return namespaces;
+
+            // Get the API token credential from Credential Vault
+            const dt_credential_resp = (await credentialVaultClient.getCredentialsDetails({id: dt_token_credential}));
+            const dt_token = dt_credential_resp['token'];
+            
+            // Query existing management zones from Dynatrace tenant
+            var dt_config_api_url = "https://" + dt_saas_tenant + ".live.dynatrace.com/api/config/v1/managementZones"
+            var dt_config_api_headers = {
+              'Authorization': "Api-Token " + dt_token
+            }
+            var dt_config_api_options = {
+              method: "GET",
+              headers: dt_config_api_headers
+            };
+            const dt_config_api_mz_resp = await fetch(dt_config_api_url,dt_config_api_options);
+            const dt_config_api_mz_resp_json = await dt_config_api_mz_resp.json();
+            var dt_existing_mz = dt_config_api_mz_resp_json['values'];
+
+            // Remove management zones that don't start with the prefix from the list
+            for(var i=0;i<dt_existing_mz.length; i++) {
+              if(!dt_existing_mz[i]['name'].startsWith(mz_prefix)) {
+                dt_existing_mz.splice(i,1);
+                i = 0;
+              }
+              if(i>=max_loop){break;}
+            }
+
+            console.log("Existing MZ:");
+            console.log(dt_existing_mz);
+            
+            // Fetch the management zone configuration JSON template from source
+            const mz_template_resp = await fetch(mz_config_url);
+            var mz_template_json = await mz_template_resp.json();
+            
+            for(var i=0; i<namespaces.length; i++) {
+
+              // Check if namespace should be excluded
+              if(ns_excludes.includes(namespaces[i])) {
+                console.log("MZ: " + mz_prefix + namespaces[i] + "; Skipped (exclude list)");   
+                continue;
+              }
+
+              // Define the management zone name
+              var mz_name = mz_prefix + namespaces[i];
+              
+              // Check if management zone already exists
+              var mz_exists;
+              var mz_id;
+              for(var e=0;e<dt_existing_mz.length;e++) {
+                if(dt_existing_mz[e]['name'] == mz_name) {
+                  mz_exists = true;
+                  mz_id = dt_existing_mz[e]['id'];
+                }
+              }
+              
+              // Replace variables in JSON template
+              var mz_template_string = JSON.stringify(mz_template_json);
+              mz_template_string = mz_template_string.replaceAll('<PREFIX>',mz_prefix);
+              mz_template_string = mz_template_string.replaceAll('<NAMESPACE>',namespaces[i]);
+              var mz_template_replace = JSON.parse(mz_template_string);
+
+              // Create or update management zone
+              if(mz_exists) { // If management zone exists, call PUT endpoint to update configuration
+
+                // Check if update_mz is false, if so skip
+                if(!update_mz) {
+                  console.log("MZ: " + mz_name + "; Skipped (Exists, Update is False)");
+                  continue;
+                }
+                // Build http fetch PUT call to Dynatrace tenant
+                dt_config_api_url = "https://" + dt_saas_tenant + ".live.dynatrace.com/api/config/v1/managementZones/" + mz_id + "/validator";
+                dt_config_api_headers = {
+                  'content-type': "application/json; charset=utf-8",
+                  'Authorization': "Api-Token " + dt_token
+                }
+                
+                // Declare http fetch options
+                const dt_config_api_options = {
+                method: "POST",
+                headers: dt_config_api_headers,
+                body: JSON.stringify(mz_template_replace)
+                };
+            
+                // Execute the fetch() api call to update the management zone
+                const dt_config_api_resp = await fetch(dt_config_api_url,dt_config_api_options);
+                if(dt_config_api_resp.status == 204) {
+                  console.log("MZ: " + mz_name + " updated; 204 - Validated. The submitted configuration is valid.");
+                } else {
+                  const dt_config_api_resp_json = await dt_config_api_resp.json();
+                  console.log("MZ: " + mz_name + "; Response: " + dt_config_api_resp.status + " Code; ");
+                  console.log(dt_config_api_resp_json);
+                }
+                
+              } 
+              else if (!mz_exists) { // If management zone does not exist, call POST endpoint to create configuration
+
+                // Build http fetch POST call to Dynatrace tenant
+                dt_config_api_url = "https://" + dt_saas_tenant + ".live.dynatrace.com/api/config/v1/managementZones/validator";
+                dt_config_api_headers = {
+                  'content-type': "application/json; charset=utf-8",
+                  'Authorization': "Api-Token " + dt_token
+                }
+                
+                // Declare http fetch options
+                const dt_config_api_options = {
+                method: "POST",
+                headers: dt_config_api_headers,
+                body: JSON.stringify(mz_template_replace)
+                };
+            
+                // Execute the fetch() api call to update the management zone
+                const dt_config_api_resp = await fetch(dt_config_api_url,dt_config_api_options);
+                if(dt_config_api_resp.status == 204) {
+                  console.log("MZ: " + mz_name + " created; 204 - Validated. The submitted configuration is valid.");
+                } else {
+                  const dt_config_api_resp_json = await dt_config_api_resp.json();
+                  console.log("MZ: " + mz_name + "; Response: " + dt_config_api_resp.status + " Code; ");
+                  console.log(dt_config_api_resp_json);
+                }
+                
+              } 
+              else {
+                console.log("How did we get here? " + mz_name);
+              }
+              
+            }
+
+            
+          }
+      position:
+        x: 0
+        y: 2
+      predecessors:
+        - js_set_parameters
+      conditions:
+        states:
+          js_set_parameters: SUCCESS
+  description: ""
+  trigger:
+    schedule:
+      rule: null
+      trigger:
+        type: time
+        time: 00:30
+      timezone: America/Chicago
+      isActive: true
+      isFaulty: false
+      nextExecution: 2024-01-18T06:30:00.000Z
+      filterParameters:
+        earliestStart: 2023-09-27
+      inputs: {}
+  schemaVersion: 3
