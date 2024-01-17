@@ -31,7 +31,7 @@ workflow:
             // Update existing management zones, otherwise skip if it already exists
             const update_mz = false;
             
-            return { dt_saas_tenant, dt_token_credential, mz_prefix, ns_excludes, max_loop, update_mz };
+            return { dt_saas_tenant, dt_token_credential, mz_prefix, ns_excludes, mz_config_url, max_loop, update_mz };
           }
       position:
         x: -1
