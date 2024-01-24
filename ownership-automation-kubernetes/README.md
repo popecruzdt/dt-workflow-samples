@@ -32,5 +32,5 @@ This sample workflow automates the ownership propagation for Kubernetes using ta
 
 #### Filter Kubernetes Workfloads and Services by Kubernetes Cluster (optional)
   * Large environments may have thousands of services, consider modifying the DQL tasks to filter the scope of the automation to a specific cluster
-  * Modify the `dql_query_workloads` task, remove the commented commands, update the value of `KUBERNETES_CLUSTER-*`
-  * Modify the `dql_query_services` task, remove the commented commands, update the value of `KUBERNETES_CLUSTER-*`
+  * Modify the `dql_query_workloads` task, uncomment the commented commands, update the value of `KUBERNETES_CLUSTER-*`
+  * Modify the `dql_query_services` task, uncomment the commented commands, update the value of `KUBERNETES_CLUSTER-*`
