@@ -1,0 +1,318 @@
+metadata:
+  version: "1"
+  dependencies:
+    apps:
+      - id: dynatrace.automations
+        version: ^1.269.0
+      - id: dynatrace.ownership
+        version: ^1.6.1
+  inputs: []
+workflow:
+  title: Ownership Automation - Kubernetes
+  tasks:
+    js_set_parameters:
+      name: js_set_parameters
+      description: Build a custom task running js Code
+      action: dynatrace.automations:run-javascript
+      input:
+        script: |-
+          import { execution } from '@dynatrace-sdk/automation-utils';
+
+          export default async function ({ execution_id }) {
+
+            let result = {
+              // no parameters required for this workflow
+            }
+
+            return result;
+          }
+      position:
+        x: 0
+        y: 1
+      predecessors: []
+    dql_query_clusters:
+      name: dql_query_clusters
+      description: Executes DQL query
+      action: dynatrace.automations:execute-dql-query
+      input:
+        query: |-
+          fetch dt.entity.kubernetes_cluster
+          | fields id
+      position:
+        x: -1
+        y: 3
+      predecessors:
+        - dql_query_cluster_nodes
+      conditions:
+        states:
+          dql_query_cluster_nodes: SUCCESS
+        custom: '{{ result("dql_query_cluster_nodes").records | length >= 1 }}'
+    dql_query_services:
+      name: dql_query_services
+      description: Executes DQL query
+      action: dynatrace.automations:execute-dql-query
+      input:
+        query: |-
+          fetch dt.entity.service
+          | filterOut isNull(belongs_to[`dt.entity.cloud_application`])
+          //| expand cluster=clustered_by[dt.entity.kubernetes_cluster]
+          //| filter cluster == "KUBERNETES_CLUSTER-97ED353F502B5402"
+          | fields id
+      position:
+        x: 1
+        y: 3
+      predecessors:
+        - dql_query_workloads
+      conditions:
+        states:
+          dql_query_workloads: SUCCESS
+        custom: '{{ result("dql_query_workloads").records | length >= 1 }}'
+    dql_query_workloads:
+      name: dql_query_workloads
+      description: Executes DQL query
+      action: dynatrace.automations:execute-dql-query
+      input:
+        query: >-
+          fetch dt.entity.cloud_application
+
+          | expand service=contains[`dt.entity.service`]
+
+          //| fieldsAdd cluster=clustered_by[dt.entity.kubernetes_cluster]
+
+          //| filter cluster == "KUBERNETES_CLUSTER-97ED353F502B5402"
+
+          | fields entity.name, owner=cloudApplicationLabels[`dt.owner`], service
+
+          | filterOut isNull(owner) or isNull(service)
+
+          | lookup [fetch dt.entity.service | fields id, service_name=entity.name], sourceField: service, lookupField: id, fields: service_name
+
+          | summarize count(), by: {owner, service, service_name}
+
+          | fields owner, service, service_name
+      position:
+        x: 1
+        y: 2
+      predecessors:
+        - js_set_parameters
+      conditions:
+        states:
+          js_set_parameters: SUCCESS
+    js_tag_cluster_owners:
+      name: js_tag_cluster_owners
+      description: Build a custom task running js Code
+      action: dynatrace.automations:run-javascript
+      input:
+        script: >-
+          import { execution} from '@dynatrace-sdk/automation-utils';
+
+          import { monitoredEntitiesCustomTagsClient } from "@dynatrace-sdk/client-classic-environment-v2";
+
+
+          const PARAMETERS_TASK_ID = "js_set_parameters";
+
+          const NODES_TASK_ID = "dql_query_cluster_nodes";
+
+          const CLUSTERS_TASK_ID = "dql_query_clusters";
+
+          const OWNER_TASK_ID = "existing_cluster_owners";
+
+
+          export default async function ({ execution_id }) {
+
+            // get the parameters from previous task
+            const exe = await execution(execution_id);
+            var parameters = await exe.result(PARAMETERS_TASK_ID);
+            
+            // get the cluster node owner details from previous task
+            const node_owners_result = await exe.result(NODES_TASK_ID);
+            var node_owners = node_owners_result['records'];
+
+            // get the cluster details from previous task
+            const clusters_result = await exe.result(CLUSTERS_TASK_ID)
+            var clusters = clusters_result['records'];
+            
+            // get the cluster owner details from previous task
+            var cluster_owners = await exe.result(OWNER_TASK_ID);
+
+            // loop through clusters and add dt.owner tag to clusters without existing ownership
+            var new_ownership = new Array();
+            for(var c=0; c<clusters.length; c++) {
+              const cluster = clusters[c];
+              if(cluster_owners[c]['owners'].length != 0) {
+                continue;
+              }
+              // no owner for cluster, identify owner from cluster nodes
+              const owner_index = (element) => element['cluster'] == cluster['id'];
+              if(node_owners.findIndex(owner_index) < 0) {
+                console.log("cluster: " + cluster['id'] + ", has no matching node owner. skipping.");
+                continue;
+              }
+              const new_owner = node_owners[node_owners.findIndex(owner_index)]['owner'];
+              // post tag using SDK
+              const resp = await monitoredEntitiesCustomTagsClient.postTags({
+                entitySelector: "type(KUBERNETES_CLUSTER),entityId(" + cluster['id'] + ")",
+                body: { tags: [{ key: "dt.owner", value: new_owner }] },
+              });
+
+              const result = {
+                'cluster': cluster['id'],
+                'owner': new_owner,
+                'response': resp
+              }
+
+              new_ownership.push(result);
+            }
+            
+            return new_ownership;
+          }
+      position:
+        x: -1
+        y: 5
+      predecessors:
+        - existing_cluster_owners
+      conditions:
+        states:
+          existing_cluster_owners: OK
+    js_tag_service_owners:
+      name: js_tag_service_owners
+      description: Build a custom task running js Code
+      action: dynatrace.automations:run-javascript
+      input:
+        script: >-
+          import { execution} from '@dynatrace-sdk/automation-utils';
+
+          import { monitoredEntitiesCustomTagsClient } from "@dynatrace-sdk/client-classic-environment-v2";
+
+
+          const PARAMETERS_TASK_ID = "js_set_parameters";
+
+          const WORKLOADS_TASK_ID = "dql_query_workloads";
+
+          const SERVICES_TASK_ID = "dql_query_services";
+
+          const OWNER_TASK_ID = "existing_service_owners";
+
+
+          export default async function ({ execution_id }) {
+
+            // get the parameters from previous task
+            const exe = await execution(execution_id);
+            var parameters = await exe.result(PARAMETERS_TASK_ID);
+            
+            // get the workload owner details from previous task
+            const workloads_result = await exe.result(WORKLOADS_TASK_ID);
+            var workload_owners = workloads_result['records'];
+
+            // get the service details from previous task
+            const services_result = await exe.result(SERVICES_TASK_ID)
+            var services = services_result['records'];
+            
+            // get the service owner details from previous task
+            var service_owners = await exe.result(OWNER_TASK_ID);
+
+            // loop through services and add dt.owner tag to services without existing ownership
+            var new_ownership = new Array();
+            for(var s=0; s<services.length; s++) {
+              const service = services[s];
+              if(service_owners[s]['owners'].length != 0) {
+                continue;
+              }
+              // no owner for service, identify owner from workload
+              const owner_index = (element) => element['service'] == service['id'];
+              if(workload_owners.findIndex(owner_index) < 0) {
+                console.log("service: " + service['id'] + ", has no matching workload owner. skipping.");
+                continue;
+              }
+              const new_owner = workload_owners[workload_owners.findIndex(owner_index)]['owner'];
+              // post tag using SDK
+              const resp = await monitoredEntitiesCustomTagsClient.postTags({
+                entitySelector: "type(SERVICE),entityId(" + service['id'] + ")",
+                body: { tags: [{ key: "dt.owner", value: new_owner }] },
+              });
+
+              const result = {
+                'service': service['id'],
+                'owner': new_owner,
+                'response': resp
+              }
+
+              new_ownership.push(result);
+            }
+            
+            return new_ownership;
+          }
+      position:
+        x: 1
+        y: 5
+      predecessors:
+        - existing_service_owners
+      conditions:
+        states:
+          existing_service_owners: OK
+    dql_query_cluster_nodes:
+      name: dql_query_cluster_nodes
+      description: Executes DQL query
+      action: dynatrace.automations:execute-dql-query
+      input:
+        query: >-
+          fetch dt.entity.kubernetes_node
+
+          | fields entity.name, owner=kubernetesLabels[`dt.owner`], cluster=clustered_by[dt.entity.kubernetes_cluster]
+
+          | filterOut isNull(owner)
+
+          | lookup [fetch dt.entity.kubernetes_cluster | fields id, cluster_name=entity.name], sourceField: cluster, lookupField: id, fields: cluster_name
+
+          | summarize count(), by: {owner, cluster, cluster_name}
+
+          | fields owner, cluster, cluster_name
+
+          | sort cluster_name asc
+      position:
+        x: -1
+        y: 2
+      predecessors:
+        - js_set_parameters
+      conditions:
+        states:
+          js_set_parameters: SUCCESS
+    existing_cluster_owners:
+      name: existing_cluster_owners
+      description: Retrieves entity and extracts ownership data from it.
+      action: dynatrace.ownership:get-ownership-from-entity
+      input:
+        entityIds: "{{ _.entity.id }}"
+        responsibilities: []
+      position:
+        x: -1
+        y: 4
+      predecessors:
+        - dql_query_clusters
+      conditions:
+        states:
+          dql_query_clusters: SUCCESS
+        custom: '{{ result("dql_query_clusters").records | length >= 1 }}'
+      concurrency: 1
+      withItems: entity in {{ result("dql_query_clusters").records }}
+    existing_service_owners:
+      name: existing_service_owners
+      description: Retrieves entity and extracts ownership data from it.
+      action: dynatrace.ownership:get-ownership-from-entity
+      input:
+        entityIds: "{{ _.entity.id }}"
+        responsibilities: []
+      position:
+        x: 1
+        y: 4
+      predecessors:
+        - dql_query_services
+      conditions:
+        states:
+          dql_query_services: SUCCESS
+        custom: '{{ result("dql_query_services").records | length >= 1 }}'
+      concurrency: 1
+      withItems: entity in {{ result("dql_query_services").records }}
+  description: ""
+  trigger: {}
+  schemaVersion: 3
