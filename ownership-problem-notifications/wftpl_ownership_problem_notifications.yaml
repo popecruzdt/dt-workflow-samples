@@ -1,0 +1,687 @@
+metadata:
+  version: "1"
+  dependencies:
+    apps:
+      - id: dynatrace.automations
+        version: ^1.269.0
+      - id: dynatrace.jira
+        version: ^3.0.0
+      - id: dynatrace.microsoft365.connector
+        version: ^0.6.3
+      - id: dynatrace.msteams
+        version: ^0.3.7
+      - id: dynatrace.ownership
+        version: ^1.6.1
+      - id: dynatrace.slack
+        version: ^1.3.3
+  inputs:
+    - type: connection
+      schema: app:dynatrace.slack:connection
+      targets:
+        - tasks.slack_notification.connection
+workflow:
+  title: Ownership Problem Notifications
+  tasks:
+    get_owner_team:
+      name: get_owner_team
+      description: Retrieves entity and extracts ownership data from it.
+      action: dynatrace.ownership:get-ownership-from-entity
+      input:
+        entityIds: "{{ _.entity }}"
+        responsibilities: []
+      position:
+        x: 0
+        y: 3
+      predecessors:
+        - js_process_event
+      conditions:
+        states:
+          js_process_event: SUCCESS
+        custom: "{{ result(\"js_process_event\")['affected_entity_ids'] | length >= 1
+          }}"
+      concurrency: 1
+      withItems: entity in {{ result("js_process_event")['affected_entity_ids'] }}
+    js_process_event:
+      name: js_process_event
+      description: Build a custom task running js Code
+      action: dynatrace.automations:run-javascript
+      input:
+        script: >-
+          import { execution } from '@dynatrace-sdk/automation-utils';
+
+
+          export default async function ({ execution_id }) {
+            
+            // get the event from the execution event
+            const ex = await execution(execution_id);
+            const event = ex.params.event;
+
+            // if there isn't a root cause determined, return flag
+            if(event['root_cause_entity_id'] === undefined) {
+              return { 'root_cause_detected': false };
+            }
+
+            // handle alerting profiles as array
+            var alerting_profiles = event['labels.alerting_profile'];
+            if(alerting_profiles === undefined) {
+              alerting_profiles = new Array();
+              alerting_profiles.push("None");
+            } else if (!Array.isArray(alerting_profiles)) {
+              const ap = alerting_profiles;
+              alerting_profiles = new Array();
+              alerting_profiles.push(ap);
+            }
+
+            // handle affected entities as array
+            var affected_entity_ids = event['affected_entity_ids'];
+            if(affected_entity_ids === undefined) {
+              affected_entity_ids = new Array();
+              affected_entity_ids.push("None");
+            } else if (!Array.isArray(affected_entity_ids)) {
+              const entity = affected_entity_ids;
+              affected_entity_ids = new Array();
+              affected_entity_ids.push(entity);
+            }
+            
+            // get the root cause entity and entity type
+            const root_cause_entity_id = event['root_cause_entity_id'];
+            const affected_entity_types = event['affected_entity_types'];
+            var root_cause_entity_type = "none";
+
+            // check if affected entity types is an array, if array then loop required
+            if(Array.isArray(affected_entity_types)) {
+
+              for(var e=0; e<affected_entity_types.length; e++) {
+                const entity_type = affected_entity_types[e];
+                if(root_cause_entity_id.startsWith(entity_type.substring(10).toUpperCase())) {
+                  root_cause_entity_type = entity_type;
+                }
+              }
+            } else {
+                const entity_type = affected_entity_types;
+                if(root_cause_entity_id.startsWith(entity_type.substring(10).toUpperCase())) {
+                  root_cause_entity_type = entity_type;
+                }
+            }
+
+            return { 
+                     'display_id': event['display_id'],
+                     'event_id': event['event.id'],
+                     'problem_url': globalThis.environmentUrl + "ui/apps/dynatrace.classic.problems/#problems/problemdetails;pid=" + event['event.id'],
+                     'workflow_url': globalThis.environmentUrl + "ui/apps/dynatrace.automations/executions/" + execution_id,
+                     'timestamp': event['timestamp'],
+                     'event_name': event['event.name'],
+                     'event_status': event['event.status'],
+                     'event_category': event['event.category'],
+                     'maintenance': event['maintenance.is_under_maintenance'],
+                     'affected_entity_ids': affected_entity_ids,
+                     'root_cause_detected': true,
+                     'root_cause_entity_type': root_cause_entity_type, 
+                     'root_cause_entity_id': root_cause_entity_id,
+                     'root_cause_entity_name': event['root_cause_entity_name'],
+                     'alerting_profiles': alerting_profiles };
+          }
+      position:
+        x: 0
+        y: 2
+      predecessors:
+        - js_set_parameters
+      conditions:
+        states:
+          js_set_parameters: SUCCESS
+    jira_notification:
+      name: jira_notification
+      description: Create new Jira issues with various fields
+      action: dynatrace.jira:jira-create-issue
+      active: false
+      input:
+        labels: []
+        taskId: "{{ task().id }}"
+        project: null
+        summary: ""
+        priority: null
+        issueType: null
+        components: []
+        description: ""
+        executionId: "{{ execution().id }}"
+        connectionId: null
+        fieldSetters: []
+        environmentUrl: https://hfn13693.apps.dynatrace.com
+      position:
+        x: 2
+        y: 6
+      predecessors:
+        - js_process_owners
+      conditions:
+        states:
+          js_process_owners: SUCCESS
+        custom: '{{ result("js_process_owners").jira_notifications | length >= 1 }}'
+        else: SKIP
+    js_process_owners:
+      name: js_process_owners
+      description: Build a custom task running js Code
+      action: dynatrace.automations:run-javascript
+      active: true
+      input:
+        script: >-
+          import { execution } from '@dynatrace-sdk/automation-utils';
+
+
+          const PARAMETERS_TASK_ID = "js_set_parameters";
+
+          const EVENT_TASK_ID = "js_process_event";
+
+          const OWNER_TASK_ID = "get_owner_team";
+
+
+          export default async function ({ execution_id }) {
+
+            // get the parameters from previous task
+            const exe = await execution(execution_id);
+            var parameters = await exe.result(PARAMETERS_TASK_ID);
+            
+            // get the event details from previous task
+            var event_result = await exe.result(EVENT_TASK_ID);
+            
+            // get the owner details from previous task
+            var owner_result = await exe.result(OWNER_TASK_ID);
+
+            // slack notifications
+            var slack_notifications = new Array();
+            if(parameters['notify_slack'] == true) {
+              for(var o=0; o<owner_result.length; o++) {
+                if(owner_result[o]['slackChannels'].length >= 1) {
+                  for(var sc=0; sc<owner_result[o]['slackChannels'].length; sc++) {
+                    const notification = {
+                      'teamName': owner_result[o]['slackChannels'][sc]['teamName'],
+                      'slackChannel': owner_result[o]['slackChannels'][sc]['slackChannel']
+                    };
+                    slack_notifications.push(notification);
+                  }
+                }
+              }
+            }
+
+            // teams notifications
+            var teams_notifications = new Array();
+            if(parameters['notify_teams'] == true) {
+              for(var o=0; o<owner_result.length; o++) {
+                if(owner_result[o]['msTeams'].length >= 1) {
+                  for(var ms=0; ms<owner_result[o]['msTeams'].length; ms++) {
+                    const notification = {
+                      'teamName': owner_result[o]['msTeams'][ms]['teamName'],
+                      'msTeams': owner_result[o]['msTeams'][ms]['msTeams']
+                    };
+                    teams_notifications.push(notification);
+                  }
+                }
+              }
+            }
+
+            // jira notifications
+            var jira_notifications = new Array();
+            if(parameters['notify_jira'] == true) {
+              for(var o=0; o<owner_result.length; o++) {
+                if(owner_result[o]['jira'].length >= 1) {
+                  for(var j=0; j<owner_result[o]['jira'].length; j++) {
+                    const notification = {
+                      'teamName': owner_result[o]['jira'][j]['teamName'],
+                      'project': owner_result[o]['jira'][j]['jira']['project'],
+                      'defaultAssignee': owner_result[o]['jira'][j]['jira']['defaultAssignee']
+                    };
+                    jira_notifications.push(notification);
+                  }
+                }
+              }
+            }
+
+            // webhook notifications
+            var webhook_notifications = new Array();
+            if(parameters['notify_webhook'] == true) {
+              for(var o=0; o<owner_result.length; o++) {
+                if(owner_result[o]['owners'].length >= 1) {
+                  for(var wh=0; wh<owner_result[o]['owners'].length; wh++) {
+                    // find the webhook property
+                    const find_webhook = (element) => element['key'] == "Webhook Notification";
+                    const webhook_url = owner_result[o]['owners'][wh]['additionalInformation'][owner_result[o]['owners'][wh]['additionalInformation'].findIndex(find_webhook)]['url'];
+                    const webhook_credential = owner_result[o]['owners'][wh]['additionalInformation'][owner_result[o]['owners'][wh]['additionalInformation'].findIndex(find_webhook)]['value'];
+                    const notification = {
+                      'teamName': owner_result[o]['owners'][wh]['name'],
+                      'webhookUrl': webhook_url,
+                      'webhookCredential': webhook_credential
+                    };
+                    webhook_notifications.push(notification);
+                  }
+                }
+              }
+            }
+
+            // email notifications
+            var email_notifications = new Array();
+            if(parameters['notify_email'] == true) {
+              for(var o=0; o<owner_result.length; o++) {
+                if(owner_result[o]['email'].length >= 1) {
+                  for(var e=0; e<owner_result[o]['email'].length; e++) {
+                    const notification = {
+                      'teamName': owner_result[o]['email'][e]['teamName'],
+                      'email': owner_result[o]['email'][e]['email']
+                    };
+                    email_notifications.push(notification);
+                  }
+                }
+              }
+            }
+            
+            return { slack_notifications, teams_notifications, jira_notifications, webhook_notifications, email_notifications };
+          }
+      position:
+        x: 0
+        y: 4
+      predecessors:
+        - get_owner_team
+      conditions:
+        states:
+          get_owner_team: OK
+    js_set_parameters:
+      name: js_set_parameters
+      description: Build a custom task running js Code
+      action: dynatrace.automations:run-javascript
+      input:
+        script: >-
+          import { execution } from '@dynatrace-sdk/automation-utils';
+
+
+          export default async function ({ execution_id }) {
+
+            let result = {
+              notify_slack: true, // true or false; slack notifications should be used
+              notify_teams: false, // true or false; microsoft teams notifications should be used
+              notify_webhook: false, // true or false; owner's custom webhook notifications should be used
+              notify_jira: false, // true or false; jira ticket notifications should be used
+              notify_email: false, // true or false; email notifications via M365 connector should be used
+            }
+
+            return result;
+          }
+      position:
+        x: -1
+        y: 1
+      predecessors: []
+    email_notification:
+      name: email_notification
+      description: Send email
+      action: dynatrace.microsoft365.connector:send-email
+      active: false
+      input:
+        cc: []
+        to: []
+        bcc: []
+        taskId: "{{ task().id }}"
+        content: ""
+        subject: ""
+        connection: ""
+        executionId: "{{ execution().id }}"
+        environmentUrl: https://hfn13693.apps.dynatrace.com
+      position:
+        x: 3
+        y: 5
+      predecessors:
+        - js_process_owners
+      conditions:
+        states:
+          js_process_owners: SUCCESS
+        custom: '{{ result("js_process_owners").email_notifications | length >= 1 }}'
+        else: SKIP
+      concurrency: 1
+      withItems: notification in {{ result("js_process_owners").email_notifications }}
+    slack_notification:
+      name: slack_notification
+      description: Send a message to a Slack workspace
+      action: dynatrace.slack:slack-send-message
+      active: true
+      input:
+        channel: "{{ _.notification['slackChannel'] }}"
+        message: >-
+          {
+          	"blocks": [
+          		{
+          			"type": "section",
+          			"block_id": "sectionHeader",
+          			"text": {
+          				"type": "mrkdwn",
+          				"text": "Dynatrace :dt: Problem Notification \n Workflow Execution: [ {{ execution().id }} ]"
+          			}
+          		},
+          		{
+          			"type": "divider"
+          		},
+          		{
+          			"type": "section",
+          			"block_id": "problemSummary",
+          			"text": {
+          				"type": "mrkdwn",
+          				"text": "Problem Status: [ {{ event()['event.status'] }} ] \n Problem Number: [ *{{ event()['display_id'] }}* ] \n Problem ID: [ {{ event()['event.id'] }} ] \n :warning: [ {{ event()['event.name'] }} ] :warning:"
+          			}
+          		},
+          		{
+          			"type": "divider"
+          		},
+          		{
+          			"type": "section",
+          			"block_id": "rootCause",
+          			"text": {
+          				"type": "mrkdwn",
+          				"text": "Root Cause: {{ result('js_process_event')['root_cause_entity_name'] }} \n Root Cause ID: {{ result('js_process_event')['root_cause_entity_id'] }} \n Root Cause Type: {{ result('js_process_event')['root_cause_entity_type'] }}"
+          			}
+          		},
+          		{
+          			"type": "divider"
+          		},
+          		{
+          			"type": "section",
+          			"block_id": "problemAlertingProfiles",
+          			"text": {
+          				"type": "mrkdwn",
+          				"text": "Alerting Profiles: {% for alert in result('js_process_event')['alerting_profiles'] %} \n - {{ alert }} {% endfor %}"
+          			}
+          		},
+          		{
+          			"type": "divider"
+          		},
+          		{
+          			"type": "actions",
+          			"elements": [
+          				{
+          					"type": "button",
+          					"text": {
+          						"type": "plain_text",
+          						"text": "View Problem",
+          						"emoji": true
+          					},
+          					"value": "problem",
+          					"url": "{{ result('js_process_event')['problem_url'] }}"
+          				},
+          				{
+          					"type": "button",
+          					"text": {
+          						"type": "plain_text",
+          						"text": "View Workflow Execution",
+          						"emoji": true
+          					},
+          					"value": "workflow",
+          					"url": "{{ result('js_process_event')['workflow_url'] }}"
+          				}
+          			]
+          		}
+          	]
+          }
+        reaction: []
+        connection: ""
+        workflowID: "{{ execution().workflow.id }}"
+        channelType: expression
+        executionID: "{{ execution().id }}"
+        executionDate: "{{ execution().started_at }}"
+        appendToThread: false
+        selectedRequestType: 0
+        attachmentToggleValue: none
+      position:
+        x: 1
+        y: 5
+      predecessors:
+        - js_process_owners
+      conditions:
+        states:
+          js_process_owners: SUCCESS
+        custom: '{{ result("js_process_owners").slack_notifications | length >= 1 }}'
+        else: SKIP
+      concurrency: 1
+      withItems: notification in {{ result("js_process_owners").slack_notifications }}
+    teams_notification:
+      name: teams_notification
+      description: Send messages and Adaptive Cards to Microsoft Teams channels
+      action: dynatrace.msteams:send-message
+      active: false
+      position:
+        x: 1
+        y: 6
+      predecessors:
+        - js_process_owners
+      conditions:
+        states:
+          js_process_owners: SUCCESS
+        custom: '{{ result("js_process_owners").teams_notifications | length >= 1 }}'
+        else: SKIP
+      concurrency: 1
+      withItems: notification in {{ result("js_process_owners").teams_notifications }}
+    webhook_notification:
+      name: webhook_notification
+      description: Build a custom task running js Code
+      action: dynatrace.automations:run-javascript
+      active: true
+      input:
+        script: >-
+          import { execution, actionExecution } from
+          '@dynatrace-sdk/automation-utils';
+
+          import { credentialVaultClient } from '@dynatrace-sdk/client-classic-environment-v2';
+
+
+          const PARAMETERS_TASK_ID = "js_set_parameters";
+
+          const EVENT_TASK_ID = "js_process_event";
+
+
+          export default async function ({ execution_id, action_execution_id }) {
+
+            // get parameters and results from previous tasks
+            const exe = await execution(execution_id);
+            const event = exe.params.event;
+
+            // parameters
+            const parameters = await exe.result(PARAMETERS_TASK_ID);
+
+            // get the event details from previous task
+            var processed_event = await exe.result(EVENT_TASK_ID);
+            
+            // get the notification loop item for the action execution
+            const actionEx = await actionExecution(action_execution_id);
+            const notification = actionEx.loopItem['notification'];
+            const team_name = notification['teamName'];
+            const webhook_url = notification['webhookUrl'];
+            const webhook_credential = notification['webhookCredential'];
+
+            // set the webhook payload from event details
+            const webhook_payload = processed_event;
+
+            // get the webhook credentials from the credential vault using the SDK
+            const data = (await credentialVaultClient.getCredentialsDetails({id: webhook_credential}));
+
+            // evaluate the credential type and set the webhook headers
+            var headers;
+            // Api-Token Authentication
+            if(data['token'] !== undefined) {
+              headers = {
+                'content-type': "application/json",
+                'Authorization': "Api-Token " + data['token'],
+              }
+            }
+            // Basic Auth Authentication
+            else if(data['username'] !== undefined && data['password'] !== undefined) {
+              headers = {
+                'content-type': "application/json",
+                'Authorization': "Basic " + btoa(data['username'] + ':' + data['password']),
+              }
+            }
+            else {
+              return team_name + ": invalid credential from credential vault";
+            }
+
+            // set the fetch() api parameters [method, headers, body]
+            const options = {
+              method: "POST",
+              headers: headers,
+              body: JSON.stringify(webhook_payload)
+            };
+            
+            // execute the fetch() api call to send webhook notification
+            const resp = await fetch(webhook_url,options);
+
+            const result = {
+              'teamName': team_name,
+              'webhookUrl': webhook_url,
+              'responseCode': resp.status,
+              'responseBody': resp.body
+            }
+            
+            // return the result
+            return result;
+          }
+      position:
+        x: 2
+        y: 5
+      predecessors:
+        - js_process_owners
+      conditions:
+        states:
+          js_process_owners: SUCCESS
+        custom: '{{ result("js_process_owners").webhook_notifications | length >= 1 }}'
+        else: SKIP
+      concurrency: 1
+      withItems: notification in {{ result("js_process_owners").webhook_notifications }}
+    js_add_problem_comment:
+      name: js_add_problem_comment
+      description: Build a custom task running js Code
+      action: dynatrace.automations:run-javascript
+      active: true
+      input:
+        script: >-
+          import { execution } from '@dynatrace-sdk/automation-utils';
+
+          import { eventsClient, problemsClient } from "@dynatrace-sdk/client-classic-environment-v2";
+
+
+          const PARAMETERS_TASK_ID = "js_set_parameters";
+
+          const EVENT_TASK_ID = "js_process_event";
+
+          const OWNER_TASK_ID = "js_process_owners";
+
+          const SLACK_TASK_ID = "slack_notification";
+
+          const TEAMS_TASK_ID = "teams_notification";
+
+          const WEBHOOK_TASK_ID = "webhook_notification";
+
+          const JIRA_TASK_ID = "jira_notification";
+
+          const EMAIL_TASK_ID = "email_notification";
+
+
+          export default async function ({ execution_id }) {
+            
+            // get the event from the execution event
+            const exe = await execution(execution_id);
+
+            // get the event details from previous task
+            var event_result = await exe.result(EVENT_TASK_ID);
+            
+            // get the notification details from previous task
+            var notifications = await exe.result(OWNER_TASK_ID);
+
+            // create an array of comments to post
+            var comments = new Array();
+
+            // parse slack notifications
+            for(var n=0; n<notifications['slack_notifications'].length; n++) {
+              const notification = notifications['slack_notifications'][n];
+              const comment = "Notification sent to [" + notification['teamName'] + "] via [Slack] using channel [" + notification['slackChannel'] + "]."
+              comments.push(comment);
+            }
+
+            // parse teams notifications
+            for(var n=0; n<notifications['teams_notifications'].length; n++) {
+              const notification = notifications['teams_notifications'][n];
+              const comment = "Notification sent to [" + notification['teamName'] + "] via [MS Teams] using team [" + notification['msTeams'] + "]."
+              comments.push(comment);
+            }
+
+            // parse webhook notifications
+            for(var n=0; n<notifications['webhook_notifications'].length; n++) {
+              const notification = notifications['webhook_notifications'][n];
+              const comment = "Notification sent to [" + notification['teamName'] + "] via [Webhook] using webhook url [" + notification['webhookUrl'] + "]."
+              comments.push(comment);
+            }
+
+            // parse jira notifications
+            for(var n=0; n<notifications['jira_notifications'].length; n++) {
+              const notification = notifications['jira_notifications'][n];
+              const comment = "Notification sent to [" + notification['teamName'] + "] via [Jira] using project [" + notification['project'] + "]."
+              comments.push(comment);
+            }
+
+            // parse email notifications
+            for(var n=0; n<notifications['email_notifications'].length; n++) {
+              const notification = notifications['email_notifications'][n];
+              const comment = "Notification sent to [" + notification['teamName'] + "] via [Email] using email address [" + notification['email'] + "]."
+              comments.push(comment);
+            }
+
+            // post comments on the problem card about notifications
+            for(var c=0; c<comments.length; c++) {
+              const problem_id = event_result['event_id'];
+              await problemsClient.createComment({
+                problemId: problem_id,
+                body: { 
+                  context: "AutomationEngine Workflow " + execution_id,
+                  message: comments[c]
+                }
+              });
+            }
+            
+            return comments;
+          }
+      position:
+        x: 0
+        y: 7
+      predecessors:
+        - get_owner_team
+        - slack_notification
+        - teams_notification
+        - jira_notification
+        - webhook_notification
+        - js_process_owners
+      conditions:
+        states:
+          get_owner_team: SUCCESS
+          jira_notification: OK
+          js_process_owners: SUCCESS
+          slack_notification: OK
+          teams_notification: OK
+          webhook_notification: OK
+        custom: ""
+  description: ""
+  trigger:
+    eventTrigger:
+      filterQuery: event.kind == "DAVIS_PROBLEM" AND event.status == "ACTIVE" AND
+        (event.category == "AVAILABILITY" OR event.category == "ERROR" OR
+        event.category == "SLOWDOWN" OR event.category == "RESOURCE_CONTENTION")
+        AND (matchesPhrase(labels.alerting_profile,"Default") and
+        isNotNull(root_cause_entity_id) and dt.davis.is_duplicate == false)
+      isActive: true
+      uniqueExpression: '{{ event()["event.id"] }}-{{ "open" if
+        event()["event.status_transition"] in ("CREATED", "UPDATED", "REOPENED")
+        else "resolved" }}-{{ event()["dt.davis.last_reopen_timestamp"] }}'
+      triggerConfiguration:
+        type: davis-problem
+        value:
+          categories:
+            error: true
+            resource: true
+            slowdown: true
+            availability: true
+          entityTags: {}
+          customFilter: matchesPhrase(labels.alerting_profile,"Default") and
+            isNotNull(root_cause_entity_id) and dt.davis.is_duplicate == false
+          onProblemClose: false
+          entityTagsMatch: null
+  schemaVersion: 3
