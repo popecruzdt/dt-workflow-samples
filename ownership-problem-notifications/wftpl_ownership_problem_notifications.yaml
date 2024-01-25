@@ -13,7 +13,7 @@ metadata:
       - id: dynatrace.ownership
         version: ^1.6.1
       - id: dynatrace.slack
-        version: ^1.3.3
+        version: ^1.3.6
   inputs:
     - type: connection
       schema: app:dynatrace.slack:connection
@@ -186,6 +186,15 @@ workflow:
             // get the owner details from previous task
             var owner_result = await exe.result(OWNER_TASK_ID);
 
+            // de-duplicate function
+            function removeDuplicates(data, key) {
+              return [
+                ...new Map(
+                  data.map(x => [key(x), x])
+                ).values()
+              ]
+            }
+            
             // slack notifications
             var slack_notifications = new Array();
             if(parameters['notify_slack'] == true) {
@@ -200,6 +209,8 @@ workflow:
                   }
                 }
               }
+              // remove duplicates
+              slack_notifications = removeDuplicates(slack_notifications, it => it.teamName);
             }
 
             // teams notifications
@@ -216,6 +227,8 @@ workflow:
                   }
                 }
               }
+              // remove duplicates
+              teams_notifications = removeDuplicates(teams_notifications, it => it.teamName);
             }
 
             // jira notifications
@@ -233,6 +246,8 @@ workflow:
                   }
                 }
               }
+              // remove duplicates
+              jira_notifications = removeDuplicates(jira_notifications, it => it.teamName);
             }
 
             // webhook notifications
@@ -254,6 +269,8 @@ workflow:
                   }
                 }
               }
+              // remove duplicates
+              webhook_notifications = removeDuplicates(webhook_notifications, it => it.teamName);
             }
 
             // email notifications
@@ -270,6 +287,8 @@ workflow:
                   }
                 }
               }
+              // remove duplicates
+              email_notifications = removeDuplicates(email_notifications, it => it.teamName);
             }
             
             return { slack_notifications, teams_notifications, jira_notifications, webhook_notifications, email_notifications };
